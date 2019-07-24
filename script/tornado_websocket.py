@@ -42,9 +42,16 @@ class ChatSocketHandler(tornado.websocket.WebSocketHandler):
     def on_close(self):
         logging.info("connection closed")
 
+    def on_ping(self, data: bytes) -> None:
+        logging.info(f"on_ping: {data}")
+
+    def on_pong(self, data: bytes) -> None:
+        logging.info(f"on_pong: {data}")
+
     def on_message(self, message):
         logging.info("got message %r", message)
         self.write_message(b"hahah", binary=True)
+        self.close(1001, "server close")
 
 
 def main():

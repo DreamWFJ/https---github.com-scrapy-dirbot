@@ -9,15 +9,14 @@ import array
 import email
 import struct
 import hashlib
-from base64 import encodebytes
+from base64 import encodebytes, b64encode
 from collections import namedtuple
 from urllib.parse import urlparse
-from twisted.internet import protocol, reactor
-from .http import to_unicode, HTTPHeaders
+from twisted.python import log
+from twisted.internet import protocol, reactor, endpoints
+from .http import to_unicode, HTTPHeaders, parse_request_start_line
 
 FrameHeader = namedtuple('FrameHeader', "fin operate_code rsv1 rsv2 rsv3 payload_length mask")
-
-_default_max_message_size = 10 * 1024 * 1024
 
 
 class WebSocketError(Exception):
@@ -68,11 +67,12 @@ def _websocket_mask_python(mask: bytes, data: bytes) -> bytes:
 
 class _WebSocketParams(object):
     def __init__(self, ping_interval, ping_timeout,
-                 max_message_size=_default_max_message_size, compression_options=None):
+                 max_message_size=None, compression_options=None, request=None):
         self.ping_interval = ping_interval
         self.ping_timeout = ping_timeout
         self.max_message_size = max_message_size
         self.compression_options = compression_options
+        self.request = request
 
 
 class _PerMessageDeflateCompressor(object):
@@ -271,6 +271,9 @@ class StateMixin:
     def _is_closing(self):
         return self._check_state(self.STATE_CLOSING)
 
+    def _view_state(self):
+        return self._state
+
 
 class WebSocketProtocol(StateMixin, protocol.Protocol):
     FIN = 0x80
@@ -280,14 +283,16 @@ class WebSocketProtocol(StateMixin, protocol.Protocol):
     RSV_MASK = RSV1 | RSV2 | RSV3
     OPCODE_MASK = 0x0F
 
+    _default_max_message_size = 10 * 1024 * 1024
+
     def __init__(self, factory):
         self.factory = factory
         self._buffer = b''
         self._state = None
         self._compressor = None
         self._selected_subprotocol = None
-        self._close_status = None
-        self._close_reason = None
+        self.close_code = None
+        self.close_reason = None
         self._frame_length = None
         self._frame_mask = None
         self._frame_compressed = None
@@ -296,10 +301,14 @@ class WebSocketProtocol(StateMixin, protocol.Protocol):
         self.server_terminated = None
         self.client_terminated = None
         self._waiting = None
+        self.mask_outgoing = True
+        self.headers = None
+        self.http_status_line = None
+        self._decompressor = None
 
     def set_status(self, status=None, reason=None):
-        self._close_status = status
-        self._close_reason = reason
+        self.close_code = status
+        self.close_reason = reason
 
     @property
     def selected_subprotocol(self):
@@ -328,11 +337,10 @@ class WebSocketProtocol(StateMixin, protocol.Protocol):
         given the value for Sec-WebSocket-Key.
         """
         sha1 = hashlib.sha1()
-        sha1.update(utf8(key))
-        sha1.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11")  # Magic value
-        return to_unicode(encodebytes(sha1.digest()))
+        sha1.update(utf8(key) + b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
+        return encodebytes(sha1.digest()).strip()
 
-    def _data_received(self, data):
+    def dataReceived(self, data):
         """
         receive data
         :param data:
@@ -349,14 +357,16 @@ class WebSocketProtocol(StateMixin, protocol.Protocol):
         elif self._is_closed:
             pass
         else:
-            raise Exception("invalid state")
+            raise Exception(f"invalid state: {self._state}")
 
     def _abort(self):
         self.client_terminated = True
         self.server_terminated = True
+        self._set_closed()
         self.transport.abortConnection()
 
     def close(self, code=None, reason=None):
+        self._set_closing()
         if not self.server_terminated:
             if code is None and reason is not None:
                 code = 1000  # "normal closure" status code
@@ -377,10 +387,7 @@ class WebSocketProtocol(StateMixin, protocol.Protocol):
             # Give the client a few seconds to complete a clean shutdown,
             # otherwise just close the connection.
             self._waiting = self.call_later(5, self._abort)
-
-    @staticmethod
-    def select_subprotocol(subprotocols):
-        return None
+        self._run_callback(self.on_closed, code, reason)
 
     def process_frame(self):
         buffered_len = len(self._buffer)
@@ -425,7 +432,7 @@ class WebSocketProtocol(StateMixin, protocol.Protocol):
         new_len = payloadlen
         if self._fragmented_message_buffer is not None:
             new_len += len(self._fragmented_message_buffer)
-        if new_len > self.params.max_message_size:
+        if new_len > self._default_max_message_size:
             self.close(1009, "message too big")
             self._abort()
             return False
@@ -472,10 +479,9 @@ class WebSocketProtocol(StateMixin, protocol.Protocol):
                 self._fragmented_message_opcode = opcode
                 self._fragmented_message_buffer = data
 
+        self._buffer = self._buffer[n:]
         if is_final_frame:
-            handled_future = self._handle_message(opcode, data)
-            if handled_future is not None:
-                await handled_future
+            self._handle_message(opcode, data)
 
     def _handle_message(self, opcode, data):
         if self.client_terminated:
@@ -509,7 +515,7 @@ class WebSocketProtocol(StateMixin, protocol.Protocol):
             if len(data) > 2:
                 self.close_reason = to_unicode(data[2:])
             # Echo the received close code, if any (RFC 6455 section 5.5.1).
-            self.close(self.close_code)
+            self.close(self.close_code, self.close_reason)
         elif opcode == 0x9:
             # Ping
             self._write_frame(True, 0xA, data)
@@ -520,7 +526,14 @@ class WebSocketProtocol(StateMixin, protocol.Protocol):
             return self._run_callback(self.on_pong, data)
         else:
             self._abort()
-        return None
+
+    def on_pong(self, data: bytes) -> None:
+        """Invoked when the response to a ping frame is received."""
+        print("on_pong: ", data)
+
+    def on_ping(self, data: bytes) -> None:
+        """Invoked when the a ping frame is received."""
+        print("on_ping: ", data)
 
     def _run_callback(self, callback, *args, **kwargs):
         """Runs the given callback with exception handling.
@@ -529,26 +542,20 @@ class WebSocketProtocol(StateMixin, protocol.Protocol):
         websocket connection and returns None.
         """
         try:
+            print("callback: ", callback, *args, **kwargs)
             result = callback(*args, **kwargs)
         except Exception:
-            self.handler.log_exception(*sys.exc_info())
+            log.err(*sys.exc_info())
             self._abort()
         else:
             return result
-
-    def process_handshake(self):
-        """
-        process websocket hand shake
-        :return:
-        """
-        raise NotImplementedError
 
     def process_proxy_connect(self):
         """
         process proxy connect
         :return:
         """
-        raise NotImplementedError
+        pass
 
     def on_open(self, addr):
         """
@@ -556,7 +563,7 @@ class WebSocketProtocol(StateMixin, protocol.Protocol):
         :param addr:
         :return:
         """
-        pass
+        raise NotImplementedError
 
     def on_message(self, data):
         """
@@ -573,15 +580,7 @@ class WebSocketProtocol(StateMixin, protocol.Protocol):
         :param reason:
         :return:
         """
-        pass
-
-    def send_message(self, data):
-        """
-        send message to peer
-        :param data:
-        :return:
-        """
-        pass
+        raise NotImplementedError
 
     @staticmethod
     def create_security_websocket_key():
@@ -591,18 +590,6 @@ class WebSocketProtocol(StateMixin, protocol.Protocol):
         """
         randomness = os.urandom(16)
         return encodebytes(randomness).decode('utf-8').strip()
-
-    def _on_frame_begin(self):
-        pass
-
-    def _on_frame_data(self):
-        pass
-
-    def _on_frame_end(self):
-        pass
-
-    def _send_frame(self, payload=b'', frame_header=None):
-        pass
 
     @staticmethod
     def _get_compressor_options(side, agreed_parameters, compression_options):
@@ -637,7 +624,7 @@ class WebSocketProtocol(StateMixin, protocol.Protocol):
             **self._get_compressor_options(side, agreed_parameters, compression_options)
         )
         self._decompressor = _PerMessageDeflateDecompressor(
-            max_message_size=self.params.max_message_size,
+            max_message_size=self._default_max_message_size,
             **self._get_compressor_options(
                 other_side, agreed_parameters, compression_options
             )
@@ -663,9 +650,9 @@ class WebSocketProtocol(StateMixin, protocol.Protocol):
             mask = os.urandom(4)
             data = mask + _websocket_mask_python(mask, data)
         frame += data
-        pass
+        self.transport.write(frame)
 
-    def _write_message(self, message, binary=False):
+    def write_message(self, message, binary=False):
         opcode = 0x2 if binary else 0x1
         message = utf8(message)
         assert isinstance(message, bytes)
@@ -675,10 +662,10 @@ class WebSocketProtocol(StateMixin, protocol.Protocol):
             flags |= self.RSV1
         try:
             fut = self._write_frame(True, opcode, message, flags=flags)
-        except:
-            raise
+        except Exception as e:
+            print(e)
 
-    def write_ping(self, data):
+    def write_ping(self, data=b""):
         assert isinstance(data, bytes)
         self._write_frame(True, 0x9, data)
 
@@ -689,50 +676,32 @@ class WebSocketProtocol(StateMixin, protocol.Protocol):
         headers = HTTPHeaders.parse(data_str[eol:])
         return start_line, headers
 
-    def _read_message(self, data):
-        start_line_str, headers = self._parse_headers(data)
-
 
 class WebSocketServerProtocol(WebSocketProtocol):
     def __init__(self, factory):
         super().__init__(factory)
-        self.headers = dict()
-        self.http_status_line = None
+        self.last_ping = None
+        self.last_pong = None
+        self.ping_callback = None
+        self.handshake_timeout_callback = None
+        self.handshake_timeout = 5
+        self.peer = None
 
     def connectionMade(self):
+        self.peer = "%s:%d" % self.transport.client
         self.factory.numProtocols += 1
+        self._set_connecting()
+        self._buffer = b''
+        self.handshake_timeout_callback = self.call_later(self.handshake_timeout, self.on_handshake_timeout)
+
+    def on_handshake_timeout(self):
+        print("on_handshake_timeout")
+        if self._is_connecting:
+            self._abort()
 
     def connectionLost(self, reason=protocol.connectionDone):
         self.factory.numProtocols -= 1
-
-    def validate(self, key, subprotocols):
-        subprotocol = None
-        for k, v in {"upgrade": "websocket",
-                     "connection": "upgrade"}.items():
-            r = self.headers.get(k)
-            if r is None:
-                return False, None
-            if v != r.lower():
-                return False, None
-        if subprotocols:
-            subprotocol = self.headers.get("sec-websocket-protocol")
-            if not subprotocol or subprotocol.lower() not in [s.lower() for s in subprotocols]:
-                return False, None
-        sec_websocket_accept = self.headers.get("sec-websocket-accept")
-        if not sec_websocket_accept:
-            return False, None
-        sec_websocket_accept = sec_websocket_accept.lower()
-        if isinstance(sec_websocket_accept, str):
-            sec_websocket_accept = sec_websocket_accept.encode('utf-8')
-
-        value = (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode('utf-8')
-        hashed = encodebytes(hashlib.sha1(value).digest()).strip().lower()
-        success = hmac.compare_digest(hashed, sec_websocket_accept)
-
-        if success:
-            return True, subprotocol
-        else:
-            return False, None
+        self._set_closed()
 
     def _handle_websocket_headers(self):
         """Verifies all invariant- and required headers
@@ -752,25 +721,30 @@ class WebSocketServerProtocol(WebSocketProtocol):
         return []
 
     def process_handshake(self):
+        self.cancel_callback(self.handshake_timeout_callback)
         end_of_header = self._buffer.find(b"\x0d\x0a\x0d\x0a")
         if end_of_header < 0:
             return
         n = end_of_header + 4
         self.http_status_line, self.headers = self._parse_headers(self._buffer[:n])
+        request_start_line = parse_request_start_line(self.http_status_line)
+        try:
+            assert request_start_line.path == self.factory.request.path
+        except AssertionError:
+            self.close(400)
+            return
         try:
             self._handle_websocket_headers()
-        except ValueError as e:
-            self.set_status(400, e)
+        except ValueError:
+            self.close(400)
+            return
         else:
             subprotocol_header = self.headers.get("Sec-WebSocket-Protocol")
             if subprotocol_header:
                 subprotocols = [s.strip() for s in subprotocol_header.split(",")]
             else:
                 subprotocols = []
-            self.selected_subprotocol = self.select_subprotocol(subprotocols)
-            if self.selected_subprotocol:
-                assert self.selected_subprotocol in subprotocols
-                self.headers.set_header("Sec-WebSocket-Protocol", self.selected_subprotocol)
+            self.selected_subprotocol = subprotocols
 
             extensions = self._parse_extensions_header(self.headers)
             for ext in extensions:
@@ -791,122 +765,210 @@ class WebSocketServerProtocol(WebSocketProtocol):
                     )
                     break
 
-            self.headers.clear_header("Content-Type")
-            self.set_status(101)
-            self.headers.set_header("Upgrade", "websocket")
-            self.headers.set_header("Connection", "Upgrade")
-            self.headers.set_header("Sec-WebSocket-Accept",
-                                    self.compute_accept_value(self.headers.get("Sec-Websocket-Key")))
+            self._buffer = self._buffer[n:]
+            sec_websocket_accept = self.compute_accept_value(self.headers.get("Sec-Websocket-Key"))
+            response = "HTTP/1.1 101 Switching Protocols\x0d\x0a"
+            response += "Upgrade: WebSocket\x0d\x0a"
+            response += "Connection: Upgrade\x0d\x0a"
+            if len(subprotocols):
+                response += "Sec-WebSocket-Protocol: %s\x0d\x0a" % ', '.join(subprotocols)
+            response += "Sec-WebSocket-Accept: %s\x0d\x0a" % str(sec_websocket_accept, encoding="utf-8")
+            if len(extensions) > 0:
+                response += "Sec-WebSocket-Extensions: %s\x0d\x0a" % ', '.join(extensions)
+            response += "\x0d\x0a"
+            self.transport.write(response.encode("utf-8"))
+            self._set_open()
+            self._run_callback(self.on_open, self.peer)
+            if len(self._buffer) > 0:
+                self.process_frame()
 
+    def on_open(self, addr):
+        self.write_message("open %s" % addr)
+
+    def on_message(self, data):
+        self.write_message("on_message %s" % data)
+
+    def on_closed(self, code=None, reason=None):
+        print("on_closed: ", code, reason)
 
     def start_pinging(self) -> None:
         """Start sending periodic pings to keep the connection alive"""
         assert self.ping_interval is not None
         if self.ping_interval > 0:
             self.last_ping = self.last_pong = self.current_time
-            self.ping_callback = PeriodicCallback(
-                self.periodic_ping, self.ping_interval * 1000
-            )
-            self.ping_callback.start()
+            self.ping_callback = self.call_later(self.ping_interval, self.periodic_ping)
+
+    def periodic_ping(self) -> None:
+        """Send a ping to keep the websocket alive
+
+        Called periodically if the websocket_ping_interval is set and non-zero.
+        """
+        if self.is_closing() and self.ping_callback is not None:
+            self.cancel_callback(self.ping_callback)
+            return
+
+        # Check for timeout on pong. Make sure that we really have
+        # sent a recent ping in case the machine with both server and
+        # client has been suspended since the last ping.
+        now = self.current_time
+        since_last_pong = now - self.last_pong
+        since_last_ping = now - self.last_ping
+        assert self.ping_interval is not None
+        assert self.ping_timeout is not None
+        if (
+                since_last_ping < 2 * self.ping_interval
+                and since_last_pong > self.ping_timeout
+        ):
+            self.close()
+            return
+
+        self.write_ping(b"")
+        self.last_ping = now
 
     def process_proxy_connect(self):
         pass
 
-    def on_message(self, data):
-        self.transport.close()
-        pass
-
 
 class WebSocketServerFactory(protocol.Factory):
-    def __init__(self):
+    def __init__(self, request):
         self.numProtocols = 0
+        self.request = request
 
     def buildProtocol(self, addr):
-        pass
+        print("WebSocketServerFactory buildProtocol")
+        return WebSocketServerProtocol(self)
 
 
 class WebSocketClientProtocol(WebSocketProtocol):
-    def __init__(self, request, compression_options=None, ping_interval=None, ping_timeout=None,
-                 max_message_size=_default_max_message_size, subprotocols=None):
-        super().__init__()
-        self.key = encodebytes(os.urandom(16))
+    def __init__(self, factory, compression_options=None, ping_interval=None, ping_timeout=None,
+                 max_message_size=None, subprotocols=None):
+        super().__init__(factory)
+        self.factory = factory
+        self.key = self.create_security_websocket_key()
         self.close_code = None
         self.close_reason = None
+        self.subprotocols = subprotocols
+        self.headers = dict()
         self.options = _WebSocketParams(
             ping_interval=ping_interval,
             ping_timeout=ping_timeout,
-            max_message_size=max_message_size,
+            max_message_size=max_message_size or self._default_max_message_size,
             compression_options=compression_options,
+            request=self.factory.request,
         )
-        scheme, sep, rest = request.url.partition(":")
-        scheme = {"ws": "http", "wss": "https"}[scheme]
-        request.url = scheme + sep + rest
-        request.headers.update(
+        self.headers.update(
             {
                 "Upgrade": "websocket",
                 "Connection": "Upgrade",
                 "Sec-WebSocket-Key": self.key,
+                "User-Agent": "PythonWebSocket",
                 "Sec-WebSocket-Version": "13",
+                "Host": "%s" % self.options.request.netloc,
+                "Origin": "http://%s" % self.options.request.netloc
             }
         )
         if subprotocols is not None:
-            request.headers["Sec-WebSocket-Protocol"] = ",".join(subprotocols)
+            self.headers["Sec-WebSocket-Protocol"] = ",".join(subprotocols)
         if compression_options is not None:
             # Always offer to let the server set our max_wbits (and even though
             # we don't offer it, we will accept a client_no_context_takeover
             # from the server).
             # TODO: set server parameters for deflate extension
             # if requested in self.compression_options.
-            request.headers[
+            self.headers[
                 "Sec-WebSocket-Extensions"
             ] = "permessage-deflate; client_max_window_bits"
 
-    def get_handshake_headers(self, resource, host, port):
-        headers = [
-            "GET %s HTTP/1.1" % resource,
-            "Upgrade: websocket",
-            "Connection: Upgrade"
-        ]
-        has_header = 'header' in self.options
-        host_port = "%s:%d" % (host, port)
-        if "host" in self.options and self.options["host"] is not None:
-            headers.append(f"Host: {self.options['host']}")
+        print(factory.request.hostname, factory.request.port, factory.request.path)
+
+    def connectionMade(self):
+        self._set_connecting()
+        self.start_handshake()
+        try:
+            self.transport.setTcpNoDelay(True)
+        except:  # don't touch this! does not work: AttributeError, OSError
+            # eg Unix Domain sockets throw Errno 22 on this
+            pass
+
+    def connectionLost(self, reason=protocol.connectionDone):
+        print("connectionLost", reason)
+        self._set_closed()
+
+    def start_handshake(self):
+        headers = ["GET %s HTTP/1.1" % self.options.request.path]
+        headers.extend([f"{k}: {v}" for k, v in self.headers.items()])
+        headers.append("\x0d\x0a")
+        data = "\x0d\x0a".join(headers)
+        self.transport.write(utf8(data))
+
+    def _validate(self):
+        subprotocol = None
+        for k, v in {"upgrade": "websocket",
+                     "connection": "upgrade"}.items():
+            r = self.headers.get(k)
+            if r is None:
+                return False, None
+            if v != r.lower():
+                return False, None
+        if self.subprotocols:
+            subprotocol = self.headers.get("sec-websocket-protocol")
+            if not subprotocol or subprotocol.lower() not in [s.lower() for s in self.subprotocols]:
+                return False, None
+        sec_websocket_accept = self.headers.get("sec-websocket-accept")
+        if not sec_websocket_accept:
+            return False, None
+        sec_websocket_accept = sec_websocket_accept.lower()
+        if isinstance(sec_websocket_accept, str):
+            sec_websocket_accept = sec_websocket_accept.encode('utf-8')
+
+        hashed = self.compute_accept_value(self.key)
+        success = hmac.compare_digest(hashed, sec_websocket_accept)
+        if success:
+            return True, subprotocol
         else:
-            headers.append(f"Host: {host_port}")
+            return False, None
 
-        if "suppress_origin" not in self.options or not self.options['suppress_origin']:
-            if "origin" in self.options and self.options["origin"] is not None:
-                headers.append(f"Origin: {self.options['origin']}")
-            else:
-                headers.append(f"Origin: http://{host_port}")
-        if not has_header or 'Sec-WebSocket-Key' not in self.options['header']:
-            key = self.create_security_websocket_key()
-            headers.append(f"Sec-WebSocket-Key: {key}")
-        else:
-            key = self.options['header']['Sec-WebSocket-Key']
+    def process_handshake(self):
+        end_of_header = self._buffer.find(b"\x0d\x0a\x0d\x0a")
+        if end_of_header < 0:
+            return
+        n = end_of_header + 4
+        self.http_status_line, self.headers = self._parse_headers(self._buffer[:n])
+        success, subproto = self._validate()
+        if not success:
+            raise WebSocketError("Invalid WebSocket Header")
 
-        if not has_header or 'Sec-WebSocket-Version' not in self.options['header']:
-            headers.append("Sec-WebSocket-Version: 13")
+        self._buffer = self._buffer[n:]
+        self._set_open()
+        self._run_callback(self.on_open, self.options.request.netloc)
 
-        subprotocols = self.options.get('subprotocols')
-        if subprotocols:
-            headers.append(f'Sec-WebSocket-Protocol: {",".join(subprotocols)}')
+    def on_closed(self, code=None, reason=None):
+        pass
 
-        if has_header:
-            header = self.options['header']
-            if isinstance(header, dict):
-                header = [": ".join([k, v]) for k, v in header.items() if v is not None]
-            headers.extend(header)
+    def on_open(self, addr):
+        pass
 
-        server_cookie = CookieJar.get(host)
-        client_cookie = self.options.get('cookie')
-        cookie = "; ".join(filter(None, [server_cookie, client_cookie]))
-        if cookie:
-            headers.append(f'Cookie: {cookie}')
-        headers.append("")
-        headers.append("")
+    def on_message(self, data):
+        pass
 
-        return headers, key
+
+class WebSocketClientFactory(protocol.ClientFactory):
+    def __init__(self, request):
+        self.numProtocols = 0
+        self.request = request
+
+    def startedConnecting(self, connector):
+        print(self.__class__.__name__, 'Started to connect.')
+
+    def buildProtocol(self, addr):
+        print(self.__class__.__name__, "buildProtocol")
+        return WebSocketClientProtocol(self)
+
+    def clientConnectionLost(self, connector, reason):
+        print(self.__class__.__name__, 'Lost connection.  Reason:', reason)
+
+    def clientConnectionFailed(self, connector, reason):
+        print(self.__class__.__name__, 'Connection failed. Reason:', reason)
 
 
 class WebSocketServer(object):
@@ -914,7 +976,11 @@ class WebSocketServer(object):
         self.request = urlparse(url)
 
     def run(self):
-        pass
+        log.startLogging(sys.stdout)
+        print("run WebSocketServer")
+        endpoint = endpoints.TCP4ServerEndpoint(reactor, self.request.port)
+        endpoint.listen(WebSocketServerFactory(self.request))
+        reactor.run()
 
 
 class WebSocketClient(object):
@@ -922,4 +988,8 @@ class WebSocketClient(object):
         self.request = urlparse(url)
 
     def run(self):
-        pass
+        log.startLogging(sys.stdout)
+        print("run WebSocketClient")
+        reactor.connectTCP(self.request.hostname, self.request.port,
+                           WebSocketClientFactory(self.request))
+        reactor.run()
